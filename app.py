@@ -3,9 +3,12 @@ import torch
 import os
 import uuid
 import time
+import traceback
 from kernel_tester import evaluate_kernel, KernelExecResult
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 @app.route('/test_kernel', methods=['POST'])
 def test_kernel():
@@ -46,7 +49,11 @@ def test_kernel():
             'metadata': result.metadata
         })
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        error_details = {
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }
+        return jsonify(error_details), 500
 
 def calculate_reward(result: KernelExecResult) -> float:
     """Calculate reward based on correctness and performance"""

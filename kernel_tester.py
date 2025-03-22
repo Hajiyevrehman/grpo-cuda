@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import importlib.util
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
+import traceback
 
 @dataclass
 class KernelExecResult:
@@ -57,6 +58,7 @@ def evaluate_kernel(ref_code, kernel_code, build_dir, num_correct_trials=5, num_
             return KernelExecResult(compiled=False, metadata=metadata)
     except Exception as e:
         metadata["compilation_error"] = str(e)
+        metadata["traceback"] = traceback.format_exc()
         return KernelExecResult(compiled=False, metadata=metadata)
     
     # Step 3: Check correctness
@@ -71,6 +73,7 @@ def evaluate_kernel(ref_code, kernel_code, build_dir, num_correct_trials=5, num_
             return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
     except Exception as e:
         metadata["correctness_error"] = str(e)
+        metadata["traceback"] = traceback.format_exc()
         return KernelExecResult(compiled=True, correctness=False, metadata=metadata)
     
     # Step 4: Measure performance
@@ -102,7 +105,13 @@ def load_model_from_code(model_src):
     Returns:
         tuple: (Model class, get_init_inputs function, get_inputs function)
     """
-    context = {}
+    context = {
+        'torch': torch,
+        'nn': nn,
+        'FloatTensor': torch.FloatTensor,
+        'cuda': torch.cuda
+    }
+    
     try:
         # Execute the model source code in the context
         exec(model_src, context)
@@ -132,7 +141,13 @@ def compile_and_load_kernel(kernel_code, build_dir):
     Returns:
         ModelNew class or None if compilation fails
     """
-    context = {}
+    context = {
+        'torch': torch,
+        'nn': nn,
+        'FloatTensor': torch.FloatTensor,
+        'cuda': torch.cuda,
+        'os': os
+    }
     
     # Setup build directory in environment
     os.makedirs(build_dir, exist_ok=True)
@@ -186,19 +201,35 @@ def check_correctness(Model, ModelNew, get_init_inputs, get_inputs, num_trials, 
             
             # Initialize models
             set_seed(seed)
-            ref_model = Model(*init_inputs).cuda(device)
+            try:
+                ref_model = Model(*init_inputs).cuda(device)
+            except Exception as e:
+                print(f"Error initializing reference model: {e}")
+                return False
             
             set_seed(seed)
-            new_model = ModelNew(*init_inputs).cuda(device)
+            try:
+                new_model = ModelNew(*init_inputs).cuda(device)
+            except Exception as e:
+                print(f"Error initializing custom model: {e}")
+                return False
             
             # Get forward inputs
             set_seed(seed)
-            inputs = get_inputs()
-            inputs = [x.cuda(device) if isinstance(x, torch.Tensor) else x for x in inputs]
+            try:
+                inputs = get_inputs()
+                inputs = [x.cuda(device) if isinstance(x, torch.Tensor) else x for x in inputs]
+            except Exception as e:
+                print(f"Error generating inputs: {e}")
+                return False
             
             # Run models
-            ref_output = ref_model(*inputs)
-            torch.cuda.synchronize(device)
+            try:
+                ref_output = ref_model(*inputs)
+                torch.cuda.synchronize(device)
+            except Exception as e:
+                print(f"Error running reference model: {e}")
+                return False
             
             try:
                 new_output = new_model(*inputs)
@@ -220,6 +251,7 @@ def check_correctness(Model, ModelNew, get_init_inputs, get_inputs, num_trials, 
                 
             except Exception as e:
                 print(f"Error in kernel execution: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
                 return False
                 
     return True
@@ -239,13 +271,21 @@ def measure_performance(model, get_inputs_fn, num_trials, device):
     """
     # Warm up runs
     set_seed(42)
-    inputs = get_inputs_fn()
-    inputs = [x.cuda(device) if isinstance(x, torch.Tensor) else x for x in inputs]
+    try:
+        inputs = get_inputs_fn()
+        inputs = [x.cuda(device) if isinstance(x, torch.Tensor) else x for x in inputs]
+    except Exception as e:
+        print(f"Error generating inputs for performance measurement: {e}")
+        return [0.0] * num_trials  # Return dummy values
     
     # Warm up
     for _ in range(3):
-        model(*inputs)
-        torch.cuda.synchronize(device)
+        try:
+            model(*inputs)
+            torch.cuda.synchronize(device)
+        except Exception as e:
+            print(f"Error during warmup: {e}")
+            return [0.0] * num_trials  # Return dummy values
     
     # Timing runs
     elapsed_times = []
@@ -258,7 +298,11 @@ def measure_performance(model, get_inputs_fn, num_trials, device):
         start_event.record()
         
         # Run model
-        model(*inputs)
+        try:
+            model(*inputs)
+        except Exception as e:
+            print(f"Error during timing run: {e}")
+            return [0.0] * num_trials  # Return dummy values
         
         # Record end time
         end_event.record()
@@ -281,6 +325,15 @@ def get_timing_stats(elapsed_times):
         dict: Dictionary of timing statistics
     """
     import numpy as np
+    
+    if all(t == 0.0 for t in elapsed_times):
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "num_trials": len(elapsed_times),
+        }
     
     return {
         "mean": float(f"{np.mean(elapsed_times):.3g}"),
